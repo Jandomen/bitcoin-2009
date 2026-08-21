@@ -184,6 +184,7 @@ mine            # ⛏️ confirma las transacciones pendientes
 ```
 getbalance                  # 💰 saldo total del wallet
 getbalance 1Hjgth...        # 💰 saldo de una dirección concreta
+printchain                  # 📖 EL LIBRO CONTABLE: todos los bloques y movimientos
 getblockcount               # 📏 altura de la cadena
 getblock 2                  # 🧱 detalles del bloque 2 (hash, merkle, nonce, txs...)
 getblock 0000d7f5ebeec83d   # 🧱 ...o búscalo por hash
@@ -191,6 +192,24 @@ getrawtransaction <txid>    # 📄 la transacción en hexadecimal crudo
 getmempoolinfo              # ⏳ transacciones esperando confirmación
 getinfo                     # ℹ️ resumen completo del nodo
 peers                       # 🌐 quién está conectado a ti
+```
+
+### 📖 ¿Dónde está "el libro"?
+
+La blockchain es un **fichero normal** en tu disco. Cada nodo escribe su copia en:
+
+```
+data/node-19001/blk0001.dat   ← el libro contable físico (formato binario original)
+```
+
+Puedes verlo entero y legible desde la CLI con `printchain`:
+
+```
+🧱 Bloque #0  000053dfa7bd4d632d2e...  2009-01-03 18:15
+   ⛏️  coinbase → 50.00000000 BTC  "The Times 03/Jan/2009 Chancellor on brink..."
+🧱 Bloque #1  000072d09a4046748e74...  2026-08-21 09:50
+   ⛏️  coinbase → 50.00000000 BTC  "minado por nodo:19001"
+   💸 cd5261fd6674821e... → 1HjgthFYZ81PYUJ3ASNLopCbkGFvcnhVMC  10.00000000 BTC
 ```
 
 ---
