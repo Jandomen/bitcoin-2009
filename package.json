@@ -1,13 +1,13 @@
 {
   "name": "bitcoin-2009",
   "version": "0.1.0",
-  "description": "Recreación fiel del Bitcoin de enero de 2009: pay-to-pubkey, bloques de 80 bytes, PoW SHA-256d con dificultad 1 y protocolo P2P binario con magic 0xF9BEB4D9. Cero dependencias.",
+  "description": "Recreaci\u00f3n fiel del Bitcoin de enero de 2009: pay-to-pubkey, bloques de 80 bytes, PoW SHA-256d con dificultad 1 y protocolo P2P binario con magic 0xF9BEB4D9. Cero dependencias.",
   "main": "src/index.js",
   "bin": {
     "bitcoin2009": "./bin/bitcoin2009.js"
   },
   "scripts": {
-    "start": "node bin/bitcoin2009.js",
+    "start": "node api.js && node bin/bitcoin2009.js",
     "demo": "node src/demo.js",
     "test": "node test/run-tests.js"
   },

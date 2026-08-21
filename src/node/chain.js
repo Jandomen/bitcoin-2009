@@ -111,12 +111,38 @@ class ChainState {
     if (prevHeight === undefined) throw new Error('Bloque anterior desconocido');
     const height = prevHeight + 1;
 
-    // Subsidio correcto
+    // Subsidio correcto. Las txs se validan contra una vista simulada que
+    // evoluciona con cada una: permite transacciones encadenadas dentro del bloque.
     const coinbase = block.transactions[0];
     if (!coinbase.isCoinBase()) throw new Error('Primera tx no es coinbase');
+    const sim = new Map(this.utxos); // copia del conjunto UTXO
+    const keyOf = (txid, n) => txid.toString('hex') + ':' + n;
     let fees = 0n;
     for (let i = 1; i < block.transactions.length; i++) {
-      fees += this.validateTransaction(block.transactions[i]).fee;
+      const tx = block.transactions[i];
+      tx.checkStructure();
+      let totalIn = 0n;
+      for (let j = 0; j < tx.inputs.length; j++) {
+        const input = tx.inputs[j];
+        const key = keyOf(input.prevTxId, input.prevN);
+        const utxo = sim.get(key);
+        if (!utxo) throw new Error(`Input ${j} de la tx ${i} gasta UTXO inexistente`);
+        if (!tx.verifyInput(j, utxo.scriptPubKey)) {
+          throw new Error(`Firma invalida en tx ${i}, input ${j}`);
+        }
+        totalIn += utxo.value;
+      }
+      const totalOut = tx.outputs.reduce((acc, o) => acc + o.value, 0n);
+      if (totalOut > totalIn) throw new Error('Outputs superan inputs');
+      fees += totalIn - totalOut;
+      // Aplica la tx a la vista simulada
+      for (const input of tx.inputs) sim.delete(keyOf(input.prevTxId, input.prevN));
+      const txid = tx.getHash();
+      tx.outputs.forEach((out, n) => {
+        if (out.value > 0n) {
+          sim.set(keyOf(txid, n), { value: out.value, scriptPubKey: out.scriptPubKey, height });
+        }
+      });
     }
     const expected = getBlockSubsidy(height) + fees;
     const actual = coinbase.outputs.reduce((a, o) => a + o.value, 0n);
@@ -127,7 +153,7 @@ class ChainState {
   }
 
   // Conecta un bloque ya validado: muta UTXOs e indices
-  connectBlock(block, height) {
+  connectBlock(block, height, options = {}) {
     const consumed = []; // [key, utxo] para restaurar si algo falla
     const created = [];  // keys de UTXOs nuevos
     try {
@@ -178,8 +204,77 @@ class ChainState {
     this.height = height;
 
     // Persistencia estilo original: [magic][size][block] en blk0001.dat
-    this._persist(block);
+    if (options.persist !== false) this._persist(block);
     return height;
+  }
+
+  // Carga la cadena desde blk0001.dat. Devuelve el numero de bloques leidos.
+  // Si la cola del fichero es invalida o divergente, se recorta conservando
+  // el prefijo valido (auto-reparacion estilo reindex).
+  loadFromDisk() {
+    if (!this.blkFile || !fs.existsSync(this.blkFile)) return 0;
+    const { MAGIC } = require('../net/messages');
+    const { Block } = require('../core/block');
+    const buf = fs.readFileSync(this.blkFile);
+    let offset = 0;
+    let loaded = 0;
+    let lastGoodOffset = 0;
+    this.loadWarnings = [];
+
+    while (offset + 8 <= buf.length) {
+      const nextOffset = offset + 8 + buf.readUInt32LE(offset + 4);
+      try {
+        if (!buf.subarray(offset, offset + 4).equals(MAGIC)) {
+          throw new Error('magic invalido');
+        }
+        const size = buf.readUInt32LE(offset + 4);
+        if (offset + 8 + size > buf.length) {
+          throw new Error('registro truncado');
+        }
+        const block = Block.deserialize(buf.subarray(offset + 8, offset + 8 + size));
+
+        if (this.height === -1) {
+          // El primer registro debe ser exactamente nuestro genesis,
+          // con merkle y PoW verificados contra sus transacciones
+          const { buildGenesis } = require('./chain');
+          const genesis = buildGenesis();
+          if (!block.getHash().equals(genesis.getHash())) {
+            throw new Error('el primer bloque del fichero no es el genesis');
+          }
+          if (!block.checkMerkleRoot()) {
+            throw new Error('las transacciones del genesis no coinciden con su merkle root');
+          }
+          if (!block.checkProofOfWork()) {
+            throw new Error('el genesis no cumple PoW');
+          }
+          this.initializeGenesis(genesis); // no re-escribe: el fichero ya existe
+        } else {
+          if (!block.prevBlockHash.equals(Buffer.from(this.tipHash, 'hex'))) {
+            throw new Error('bloque de otra cadena (prevBlockHash no enlaza)');
+          }
+          this.validateBlock(block); // revalida PoW, merkle, firmas y subsidio
+          this.connectBlock(block, this.height + 1, { persist: false });
+        }
+        offset = nextOffset;
+        lastGoodOffset = offset;
+        loaded++;
+      } catch (err) {
+        if (this.height === -1) {
+          throw new Error(
+            `blk0001.dat ilegible desde el principio (${err.message}). ` +
+            `Elimina el directorio de datos para empezar una cadena nueva.`
+          );
+        }
+        // Cola invalida o divergente: recorta el fichero y sigue con lo valido
+        const discarded = buf.length - lastGoodOffset;
+        fs.truncateSync(this.blkFile, lastGoodOffset);
+        this.loadWarnings.push(
+          `descartados ${discarded} bytes corruptos/divergentes desde el bloque ${loaded} (${err.message})`
+        );
+        break;
+      }
+    }
+    return loaded;
   }
 
   _persist(block) {
