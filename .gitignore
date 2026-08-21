@@ -1,0 +1,19 @@
+# Dependencias (el proyecto no tiene, pero por si acaso)
+node_modules/
+
+# Datos de los nodos: cadenas de bloques y wallets locales
+data/
+*.dat
+
+# Registros y temporales
+*.log
+tmp/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editores e IDEs
+.vscode/
+.idea/
+*.swp
