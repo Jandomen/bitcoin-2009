@@ -37,10 +37,14 @@ class FullNode extends EventEmitter {
     this.mining = false;
     this.blocksMined = 0;
 
-    // Genesis determinista
-    const genesis = buildGenesis();
+    // Carga la cadena desde blk0001.dat o crea el genesis determinista
+    const loaded = this.chain.loadFromDisk();
+    if (loaded > 0) {
+      // Los logs se emiten cuando existan listeners; guarda para start()
+      this._loadedFromDisk = loaded;
+    }
     if (this.chain.height === -1) {
-      this.chain.initializeGenesis(genesis);
+      this.chain.initializeGenesis(buildGenesis());
     }
 
     this._setupHandlers();
@@ -76,6 +80,12 @@ class FullNode extends EventEmitter {
 
   async start() {
     await this.network.start();
+    if (this._loadedFromDisk) {
+      this.emit('log', `cargados ${this._loadedFromDisk} bloques desde blk0001.dat`);
+    }
+    for (const warning of this.chain.loadWarnings || []) {
+      this.emit('log', `⚠️  auto-reparacion: ${warning}`);
+    }
     this.emit('log', `nodo escuchando en puerto ${this.port}, altura ${this.chain.height}`);
   }
 
@@ -177,14 +187,12 @@ class FullNode extends EventEmitter {
   getBalance(address) {
     const entry = this.wallet[address];
     if (!entry) throw new Error('Direccion desconocida para este nodo');
-    let balance = this.chain.getBalance(entry.publicKey);
-    // Suma tambien salidas de mempool hacia nosotros
-    for (const tx of this.mempool.values()) {
-      for (const out of tx.outputs) {
-        if (out.scriptPubKey.equals(require('../core/script').createPayToPubKeyScript(entry.publicKey))) {
-          balance += out.value;
-        }
-      }
+    // Saldo sobre el conjunto efectivo: cadena + cambios pendientes - gastos pendientes
+    const script = require('../core/script');
+    const target = script.createPayToPubKeyScript(entry.publicKey);
+    let balance = 0n;
+    for (const [, utxo] of this._effectiveUtxoSet()) {
+      if (utxo.scriptPubKey.equals(target)) balance += utxo.value;
     }
     return balance;
   }
@@ -197,15 +205,66 @@ class FullNode extends EventEmitter {
     return total;
   }
 
+  // Conjunto UTXO efectivo: cadena + salidas no confirmadas de la mempool,
+  // menos outpoints ya gastados por transacciones pendientes.
+  _effectiveUtxoSet() {
+    const utxos = new Map(); // "txid:n" -> { value, scriptPubKey }
+    for (const [key, u] of this.chain.utxos) {
+      utxos.set(key, { value: u.value, scriptPubKey: u.scriptPubKey });
+    }
+    for (const tx of this.mempool.values()) {
+      for (const input of tx.inputs) {
+        utxos.delete(input.prevTxId.toString('hex') + ':' + input.prevN);
+      }
+      const txid = tx.getHash().toString('hex');
+      tx.outputs.forEach((out, n) => {
+        const key = txid + ':' + n;
+        if (!utxos.has(key)) {
+          utxos.set(key, { value: out.value, scriptPubKey: out.scriptPubKey, unconfirmed: true });
+        }
+      });
+    }
+    return utxos;
+  }
+
+  // Validacion contra cadena + mempool (permite txs encadenadas)
+  _validateAgainstState(tx) {
+    tx.checkStructure();
+    const effective = this._effectiveUtxoSet();
+    let totalIn = 0n;
+    for (let i = 0; i < tx.inputs.length; i++) {
+      const input = tx.inputs[i];
+      const key = input.prevTxId.toString('hex') + ':' + input.prevN;
+      const utxo = effective.get(key);
+      if (!utxo) throw new Error('Input gasta UTXO inexistente o ya gastado');
+      if (!tx.verifyInput(i, utxo.scriptPubKey)) {
+        throw new Error(`Firma invalida en input ${i}`);
+      }
+      totalIn += utxo.value;
+    }
+    const totalOut = tx.outputs.reduce((acc, o) => acc + o.value, 0n);
+    if (totalOut > totalIn) throw new Error('Outputs superan inputs');
+    return { fee: totalIn - totalOut };
+  }
+
   // ---- Transacciones ----
   sendToAddress(toPubKey, amountBtc) {
     const amount = BigInt(Math.round(amountBtc * 100000000));
     const inputs = [];
     let gathered = 0n;
-    for (const address of Object.keys(this.wallet)) {
-      const entry = this.wallet[address];
-      for (const utxo of this.chain.getUtxosFor(entry.publicKey)) {
-        inputs.push({ prevTx: this.findTxByHash(utxo.txidRaw), prevN: utxo.n });
+    // Solo direcciones con clave privada pueden gastar
+    const spendable = Object.entries(this.wallet).filter(([, e]) => e.privateKey);
+    const script = require('../core/script');
+    const effective = this._effectiveUtxoSet();
+    for (const [address, entry] of spendable) {
+      const target = script.createPayToPubKeyScript(entry.publicKey);
+      for (const [key, utxo] of effective) {
+        if (!utxo.scriptPubKey.equals(target)) continue;
+        const [txidHex, nStr] = key.split(':');
+        inputs.push({
+          prevTx: this.findTxByHash(Buffer.from(txidHex, 'hex')),
+          prevN: Number(nStr),
+        });
         gathered += utxo.value;
         if (gathered >= amount) break;
       }
@@ -214,7 +273,7 @@ class FullNode extends EventEmitter {
     if (gathered < amount) throw new Error('Saldo insuficiente');
 
     const keysByAddress = {};
-    for (const [addr, entry] of Object.entries(this.wallet)) {
+    for (const [addr, entry] of spendable) {
       keysByAddress[addr] = entry.privateKey;
     }
 
@@ -240,8 +299,8 @@ class FullNode extends EventEmitter {
     const key = tx.getHash().toString('hex');
     if (this.mempool.has(key) || this.knownTxs.has(key)) return false;
 
-    this.chain.validateTransaction(tx); // lanza si invalida
     this._checkMempoolConflicts(tx); // doble gasto en espera de confirmacion
+    this._validateAgainstState(tx); // lanza si invalida
     this.mempool.set(key, tx);
     this.knownTxs.add(key);
 
@@ -263,7 +322,10 @@ class FullNode extends EventEmitter {
       for (const input of pending.inputs) {
         const key = input.prevTxId.toString('hex') + ':' + input.prevN;
         if (spent.has(key)) {
-          throw new Error('Doble gasto: el outpoint ya esta en la mempool');
+          throw new Error(
+            'Doble gasto: ese outpoint ya esta en la mempool esperando confirmacion. ' +
+            'Mina un bloque (mine) para confirmar las transacciones pendientes'
+          );
         }
       }
     }
@@ -276,7 +338,9 @@ class FullNode extends EventEmitter {
     try {
       let address = minerAddress;
       if (!address) {
-        address = Object.keys(this.wallet)[0] ?? this.createNewAddress('minero');
+        // Mina a una direccion propia con clave privada (no watch-only)
+        const spendable = Object.keys(this.wallet).filter((a) => this.wallet[a].privateKey);
+        address = spendable[0] ?? this.createNewAddress('minero');
       }
       const pubKey = this.wallet[address].publicKey;
 
